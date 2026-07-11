@@ -22,8 +22,8 @@
     + "#tn-preloader svg.tn-pl-layer{position:absolute;top:0;left:0;width:100%;height:100%;display:block;}"
     /* reveal layer now grows via CSS transform (GPU-composited) instead of per-frame JS math -
        this is what makes the black fill smooth even while the video is buffering on the main thread */
-    + "#tn-preloader svg.tn-pl-reveal{transform-origin:50% 100%;transform:scaleY(0);"
-    +   "transition:transform " + (REVEAL_STEP_MS / 1000) + "s linear;will-change:transform;}"
+    + "#tn-preloader svg.tn-pl-reveal{clip-path:inset(100% 0 0 0);"
+    +   "transition:clip-path " + (REVEAL_STEP_MS / 1000) + "s linear;will-change:clip-path;}"
     + ".tn-pl-strokes{fill:none;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
     + ".tn-pl-strokes--white{stroke:#fff;}"
     + ".tn-pl-center--blue{fill:#274CD3;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
@@ -51,9 +51,9 @@
     +   '<use href="#centerA" class="tn-pl-strokes"></use>'
     + '</svg>'
 
-    /* reveal layer: black bg + white pattern + blue center A, grows from bottom via CSS transform
-       (scaleY on the whole layer instead of animating a clip-path rect's height/y every frame -
-       transform is compositor-only, so it stays smooth even when the main thread is busy) */
+    /* reveal layer: black bg + white pattern + blue center A, always rendered full-size
+       (never scaled - scaling stretched the pattern and the blue A, which is what caused
+       the distortion) and revealed bottom-up purely via a CSS clip-path transition */
     + '<svg class="tn-pl-layer tn-pl-reveal" id="tn-pl-reveal" viewBox="' + VB + '" preserveAspectRatio="xMidYMid slice">'
     +   '<rect width="' + VB_W + '" height="' + VB_H + '" fill="#000"/>'
     +   '<use href="#tn-pl-shapes" class="tn-pl-strokes tn-pl-strokes--white"></use>'
@@ -87,16 +87,17 @@
   var target = 0;
   var done = false;
 
-  /* The black fill now grows via a CSS "transition: transform" on the reveal layer
+  /* The black fill now grows via a CSS "transition: clip-path" on the reveal layer
      (see REVEAL_STEP_MS above) instead of a JS rAF loop recalculating a clip-path
      rect's height/y every frame. That per-frame attribute math was the main cause
      of the "дёргано" (jerky) fill: it competes with the video decode on the main
-     thread, so frames get skipped. A CSS transform is handled by the compositor,
-     so it stays smooth regardless of what the main thread is doing. */
+     thread, so frames get skipped. Letting CSS handle the clip-path transition
+     stays smooth regardless of what the main thread is doing, and - unlike scaling
+     the whole layer - clipping never stretches or distorts the pattern/blue A. */
   function setTarget(p) {
     if (p <= target) return;
     target = Math.min(100, p);
-    revealLayer.style.transform = 'scaleY(' + (target / 100) + ')';
+    revealLayer.style.clipPath = 'inset(' + (100 - target) + '% 0 0 0)';
     // percentLabel.textContent = Math.round(target) + '%'; // отключено по просьбе (см. CSS: display:none)
   }
 
