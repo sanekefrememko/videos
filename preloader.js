@@ -9,7 +9,7 @@
   var CRAWL_DURATION = 4000;     // ms for the crawl to approach CRAWL_TARGET
   var FINISH_HOLD_MS = 350;      // pause at 100% before fade out
   var BG_COLOR = '#ffffff';      // base (not-yet-loaded) background color
-  var REVEAL_STEP_MS = 260;      // CSS transition length for each progress update (smooths the black fill)
+  var REVEAL_STEP_MS = 260;      // CSS transition length for the final snap-to-100% fill
 
   var VB = '0 0 4582 3202';      // pattern_A.svg viewBox
   var VB_W = 4582, VB_H = 3202;
@@ -20,10 +20,18 @@
     + "#tn-preloader{position:fixed;inset:0;z-index:99999;overflow:hidden;background:" + BG_COLOR + ";transition:opacity .7s ease;}"
     + "#tn-preloader.tn-preloader--hidden{opacity:0;pointer-events:none;}"
     + "#tn-preloader svg.tn-pl-layer{position:absolute;top:0;left:0;width:100%;height:100%;display:block;}"
-    /* reveal layer now grows via CSS transform (GPU-composited) instead of per-frame JS math -
-       this is what makes the black fill smooth even while the video is buffering on the main thread */
-    + "#tn-preloader svg.tn-pl-reveal{clip-path:inset(100% 0 0 0);"
-    +   "transition:clip-path " + (REVEAL_STEP_MS / 1000) + "s linear;will-change:clip-path;}"
+    /* The "crawling" progress (0 -> CRAWL_TARGET%) now runs as a pure CSS @keyframes
+       animation instead of a JS setInterval nudging clip-path every 100ms. A JS timer
+       can get delayed by main-thread work (the video buffering/decoding), and when it
+       catches up it jumps several steps at once - that's exactly the "резкие скачки"
+       you saw. A CSS animation is scheduled by the browser itself, not by JS callbacks,
+       so it keeps ticking smoothly regardless of what the main thread is doing. */
+    + "@keyframes tnPlCrawl{from{clip-path:inset(100% 0 0 0);}to{clip-path:inset(" + (100 - CRAWL_TARGET) + "% 0 0 0);}}"
+    + "#tn-preloader svg.tn-pl-reveal{clip-path:inset(100% 0 0 0);will-change:clip-path;}"
+    + "#tn-preloader svg.tn-pl-reveal.tn-pl-crawling{animation:tnPlCrawl " + CRAWL_DURATION + "ms cubic-bezier(.22,1,.36,1) forwards;}"
+    /* only the final "video is ready, snap the rest of the way to 100%" step still
+       uses a JS-set value - and it's a single one-off transition, not a repeating timer */
+    + "#tn-preloader svg.tn-pl-reveal.tn-pl-finishing{transition:clip-path " + (REVEAL_STEP_MS / 1000) + "s ease-out;}"
     + ".tn-pl-strokes{fill:none;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
     + ".tn-pl-strokes--white{stroke:#fff;}"
     + ".tn-pl-center--blue{fill:#274CD3;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
@@ -84,40 +92,33 @@
 
   /* ===================== PROGRESS DRIVER ===================== */
 
-  var target = 0;
   var done = false;
 
-  /* The black fill now grows via a CSS "transition: clip-path" on the reveal layer
-     (see REVEAL_STEP_MS above) instead of a JS rAF loop recalculating a clip-path
-     rect's height/y every frame. That per-frame attribute math was the main cause
-     of the "дёргано" (jerky) fill: it competes with the video decode on the main
-     thread, so frames get skipped. Letting CSS handle the clip-path transition
-     stays smooth regardless of what the main thread is doing, and - unlike scaling
-     the whole layer - clipping never stretches or distorts the pattern/blue A. */
-  function setTarget(p) {
-    if (p <= target) return;
-    target = Math.min(100, p);
-    revealLayer.style.clipPath = 'inset(' + (100 - target) + '% 0 0 0)';
-    // percentLabel.textContent = Math.round(target) + '%'; // отключено по просьбе (см. CSS: display:none)
-  }
-
-  /* fake crawl so the user always sees continuous movement,
-     capped below 100 until we get a real "ready" signal */
-  var crawlStart = Date.now();
-  var crawlTimer = setInterval(function () {
-    if (done) { clearInterval(crawlTimer); return; }
-    var elapsed = Date.now() - crawlStart;
-    var progress = Math.min(1, elapsed / CRAWL_DURATION);
-    // ease-out so it slows down as it approaches the cap
-    var eased = 1 - Math.pow(1 - progress, 3);
-    setTarget(eased * CRAWL_TARGET);
-  }, 100);
+  /* Kick off the CSS-driven crawl (0 -> CRAWL_TARGET% over CRAWL_DURATION) by
+     adding a class - the browser now owns the timing entirely, no JS timer involved,
+     so there's nothing for main-thread video-decode work to delay or bunch up. */
+  revealLayer.classList.add('tn-pl-crawling');
 
   function finish() {
     if (done) return;
     done = true;
-    clearInterval(crawlTimer);
-    setTarget(100);
+
+    /* Freeze the crawl exactly where the CSS animation currently is, then hand off
+       to a short transition up to 100%. Reading the animation's live computed value
+       and "freezing" it before switching to the transition is what avoids a jump
+       between "still crawling" and "final fill" - there's no instant only a smooth
+       change of gears. */
+    var frozenClip = getComputedStyle(revealLayer).clipPath;
+    revealLayer.classList.remove('tn-pl-crawling');
+    revealLayer.style.animation = 'none';
+    revealLayer.style.clipPath = frozenClip;
+    void revealLayer.offsetHeight; // force reflow so the frozen value is registered first
+    revealLayer.classList.add('tn-pl-finishing');
+    requestAnimationFrame(function () {
+      revealLayer.style.clipPath = 'inset(0% 0 0 0)';
+    });
+
+    // percentLabel.textContent = '100%'; // отключено по просьбе (см. CSS: display:none)
     setTimeout(hidePreloader, REVEAL_STEP_MS + FINISH_HOLD_MS);
   }
 
