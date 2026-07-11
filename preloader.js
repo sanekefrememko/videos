@@ -19,6 +19,9 @@
   var css = ""
     + "#tn-preloader{position:fixed;inset:0;z-index:99999;overflow:hidden;background:" + BG_COLOR + ";transition:opacity .7s ease;}"
     + "#tn-preloader.tn-preloader--hidden{opacity:0;pointer-events:none;}"
+    /* locks the scroll and hides the scrollbar for as long as the preloader is up -
+       applied to <html> (always exists) and, once it's created, <body> too */
+    + "html.tn-preloader-lock,html.tn-preloader-lock body{overflow:hidden !important;height:100% !important;}"
     + "#tn-preloader svg.tn-pl-layer{position:absolute;top:0;left:0;width:100%;height:100%;display:block;}"
     /* The "crawling" progress (0 -> CRAWL_TARGET%) now runs as a pure CSS @keyframes
        animation instead of a JS setInterval nudging clip-path every 100ms. A JS timer
@@ -87,6 +90,11 @@
      showed up - documentElement always exists immediately. */
   document.documentElement.appendChild(preloader);
 
+  /* Lock scroll / hide the scrollbar the moment the preloader shows up, so the
+     content underneath can't be scrolled into view. Applied to documentElement
+     (exists immediately); the CSS rule above also covers body once it exists. */
+  document.documentElement.classList.add('tn-preloader-lock');
+
   var revealLayer = document.getElementById('tn-pl-reveal');
   var percentLabel = document.getElementById('tn-pl-percent'); // kept for reference; display is disabled via CSS
 
@@ -129,6 +137,7 @@
         preloader.parentNode.removeChild(preloader);
       }
       styleEl.parentNode && styleEl.parentNode.removeChild(styleEl);
+      document.documentElement.classList.remove('tn-preloader-lock');
     }, 750);
   }
 
