@@ -5,11 +5,12 @@
   var VIDEO_SELECTOR = '.tn-atom__videoiframe video';
   var MIN_BUFFER_AHEAD = 2;      // seconds of buffer required before we call it "ready"
   var FALLBACK_MS = 10000;       // hard cap, hide preloader no matter what
-  var CRAWL_TARGET = 88;         // % the fake progress crawls to while waiting for real signal
-  var CRAWL_DURATION = 4000;     // ms for the crawl to approach CRAWL_TARGET
+  var CRAWL_TARGET = 92;         // soft % ceiling the fake progress creeps toward while waiting
+  var CRAWL_EASE = 0.0022;       // per-ms easing rate toward CRAWL_TARGET while waiting
+  var CRAWL_MIN_RATE = 0.0009;   // %/ms constant creep - keeps it inching even once close to target
+  var FINISH_EASE = 0.02;        // per-ms easing rate toward 100% once the real ready signal fires
   var FINISH_HOLD_MS = 350;      // pause at 100% before fade out
   var BG_COLOR = '#ffffff';      // base (not-yet-loaded) background color
-  var REVEAL_STEP_MS = 260;      // CSS transition length for the final snap-to-100% fill
 
   var VB = '0 0 4582 3202';      // pattern_A.svg viewBox
   var VB_W = 4582, VB_H = 3202;
@@ -23,23 +24,19 @@
        applied to <html> (always exists) and, once it's created, <body> too */
     + "html.tn-preloader-lock,html.tn-preloader-lock body{overflow:hidden !important;height:100% !important;}"
     + "#tn-preloader svg.tn-pl-layer{position:absolute;top:0;left:0;width:100%;height:100%;display:block;}"
-    /* The reveal is now driven by translateY() on the SVG itself, clipped by a
-       plain overflow:hidden wrapper - NOT by animating clip-path directly on the
-       SVG. clip-path on an element with hundreds of <path>s forces the browser to
-       rasterize the newly-exposed vector geometry on every single frame, and when
-       that collides with main-thread work (the video buffering/decoding) those
-       rasterization steps get delayed and bunched up - that's exactly the
-       "рывками" you were seeing. translateY is a pure compositor transform: the
-       SVG gets painted once into a texture and the GPU just slides it around,
-       the same way native scrolling works, so it stays smooth no matter what
-       else the main thread is doing. */
-    + "#tn-preloader .tn-pl-reveal-wrap{position:absolute;top:0;left:0;width:100%;height:100%;overflow:hidden;}"
-    + "@keyframes tnPlCrawl{from{transform:translateY(100%);}to{transform:translateY(" + (100 - CRAWL_TARGET) + "%);}}"
-    + "#tn-preloader svg.tn-pl-reveal{transform:translateY(100%);will-change:transform;backface-visibility:hidden;}"
-    + "#tn-preloader svg.tn-pl-reveal.tn-pl-crawling{animation:tnPlCrawl " + CRAWL_DURATION + "ms cubic-bezier(.22,1,.36,1) forwards;}"
-    /* only the final "video is ready, snap the rest of the way to 100%" step still
-       uses a JS-set value - and it's a single one-off transition, not a repeating timer */
-    + "#tn-preloader svg.tn-pl-reveal.tn-pl-finishing{transition:transform " + (REVEAL_STEP_MS / 1000) + "s ease-out;}"
+    /* No CSS animation/transition here on purpose. The reveal SVG stays completely
+       static (never translated, never scaled) - only its clip-path is updated, every
+       frame, directly from JS. Two earlier attempts both had a real problem:
+       1) a fixed-duration CSS @keyframes crawl finishes and FREEZES if the video
+          isn't ready yet by then - that dead stop, followed by a fast snap to 100%
+          once it is ready, is exactly what reads as a "рывок".
+       2) sliding the SVG itself with translateY() carries the pattern and the blue
+          "A" along with it, so it looks like a rigid block driving up from below
+          instead of the black "painting over" a pattern that stays put.
+       Driving clip-path every rAF frame from elapsed real time (see PROGRESS DRIVER
+       below) fixes both: the content never moves, and the fill never fully stops -
+       it only speeds up or slows down, right up until it hits 100%. */
+    + "#tn-preloader svg.tn-pl-reveal{clip-path:inset(100% 0 0 0);will-change:clip-path;}"
     + ".tn-pl-strokes{fill:none;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
     + ".tn-pl-strokes--white{stroke:#fff;}"
     + ".tn-pl-center--blue{fill:#274CD3;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
@@ -69,16 +66,13 @@
 
     /* reveal layer: black bg + white pattern + blue center A, always rendered full-size
        (never scaled - scaling stretched the pattern and the blue A, which is what caused
-       the distortion). It sits inside a plain overflow:hidden wrapper and is revealed
-       bottom-up by translateY-ing the SVG itself (see CSS comment above for why, instead
-       of clip-path'ing the SVG's content directly). */
-    + '<div class="tn-pl-reveal-wrap">'
-    +   '<svg class="tn-pl-layer tn-pl-reveal" id="tn-pl-reveal" viewBox="' + VB + '" preserveAspectRatio="xMidYMid slice">'
-    +     '<rect width="' + VB_W + '" height="' + VB_H + '" fill="#000"/>'
-    +     '<use href="#tn-pl-shapes" class="tn-pl-strokes tn-pl-strokes--white"></use>'
-    +     '<use href="#centerA" class="tn-pl-center--blue"></use>'
-    +   '</svg>'
-    + '</div>'
+       the distortion) and never translated either - it stays perfectly still, only its
+       clip-path changes, so the pattern/letter don't slide, they get painted over in place */
+    + '<svg class="tn-pl-layer tn-pl-reveal" id="tn-pl-reveal" viewBox="' + VB + '" preserveAspectRatio="xMidYMid slice">'
+    +   '<rect width="' + VB_W + '" height="' + VB_H + '" fill="#000"/>'
+    +   '<use href="#tn-pl-shapes" class="tn-pl-strokes tn-pl-strokes--white"></use>'
+    +   '<use href="#centerA" class="tn-pl-center--blue"></use>'
+    + '</svg>'
 
     + '<div class="tn-pl-percent" id="tn-pl-percent">0%</div>';
 
@@ -110,33 +104,54 @@
   /* ===================== PROGRESS DRIVER ===================== */
 
   var done = false;
+  var progress = 0;          // 0..100, current revealed %
+  var target = CRAWL_TARGET; // soft ceiling while waiting; bumped to 100 once finish() fires
+  var lastTs = null;
+  var rafId = null;
 
-  /* Kick off the CSS-driven crawl (0 -> CRAWL_TARGET% over CRAWL_DURATION) by
-     adding a class - the browser now owns the timing entirely, no JS timer involved,
-     so there's nothing for main-thread video-decode work to delay or bunch up. */
-  revealLayer.classList.add('tn-pl-crawling');
+  function applyProgress(p) {
+    revealLayer.style.clipPath = 'inset(' + (100 - p).toFixed(2) + '% 0 0 0)';
+    // if (percentLabel) percentLabel.textContent = Math.round(p) + '%'; // отключено по просьбе
+  }
+
+  /* Every frame, ease `progress` toward `target` by a fraction of the remaining
+     distance, computed from real elapsed time (not a step counter) - so a slow or
+     delayed frame just means a bigger dt on the next one, never a pile of missed
+     steps to catch up on. On top of that, a tiny constant creep keeps it inching
+     forward even once it's basically caught up to `target`, so the bar is always
+     doing *something* - never a hard stop, only faster or slower. Calling finish()
+     just raises `target` to 100 (and switches to a snappier ease) - same loop,
+     same continuous motion, it just leans in and finishes instead of freezing then
+     jumping. */
+  function tick(ts) {
+    if (lastTs === null) lastTs = ts;
+    var dt = Math.min(ts - lastTs, 100); // clamp so a long main-thread stall can't cause a big catch-up jump
+    lastTs = ts;
+
+    var ease = done ? FINISH_EASE : CRAWL_EASE;
+    progress += (target - progress) * ease * dt;
+
+    if (!done && progress < target) {
+      progress += CRAWL_MIN_RATE * dt;
+      if (progress > target) progress = target;
+    }
+
+    if (done && progress > 99.6) {
+      applyProgress(100);
+      setTimeout(hidePreloader, FINISH_HOLD_MS);
+      return; // stop the loop, we're done
+    }
+
+    applyProgress(progress);
+    rafId = requestAnimationFrame(tick);
+  }
+
+  rafId = requestAnimationFrame(tick);
 
   function finish() {
     if (done) return;
     done = true;
-
-    /* Freeze the crawl exactly where the CSS animation currently is, then hand off
-       to a short transition up to 100%. Reading the animation's live computed value
-       and "freezing" it before switching to the transition is what avoids a jump
-       between "still crawling" and "final fill" - there's no instant only a smooth
-       change of gears. */
-    var frozenTransform = getComputedStyle(revealLayer).transform;
-    revealLayer.classList.remove('tn-pl-crawling');
-    revealLayer.style.animation = 'none';
-    revealLayer.style.transform = frozenTransform;
-    void revealLayer.offsetHeight; // force reflow so the frozen value is registered first
-    revealLayer.classList.add('tn-pl-finishing');
-    requestAnimationFrame(function () {
-      revealLayer.style.transform = 'translateY(0%)';
-    });
-
-    // percentLabel.textContent = '100%'; // отключено по просьбе (см. CSS: display:none)
-    setTimeout(hidePreloader, REVEAL_STEP_MS + FINISH_HOLD_MS);
+    target = 100;
   }
 
   function hidePreloader() {
