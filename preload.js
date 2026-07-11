@@ -23,18 +23,23 @@
        applied to <html> (always exists) and, once it's created, <body> too */
     + "html.tn-preloader-lock,html.tn-preloader-lock body{overflow:hidden !important;height:100% !important;}"
     + "#tn-preloader svg.tn-pl-layer{position:absolute;top:0;left:0;width:100%;height:100%;display:block;}"
-    /* The "crawling" progress (0 -> CRAWL_TARGET%) now runs as a pure CSS @keyframes
-       animation instead of a JS setInterval nudging clip-path every 100ms. A JS timer
-       can get delayed by main-thread work (the video buffering/decoding), and when it
-       catches up it jumps several steps at once - that's exactly the "резкие скачки"
-       you saw. A CSS animation is scheduled by the browser itself, not by JS callbacks,
-       so it keeps ticking smoothly regardless of what the main thread is doing. */
-    + "@keyframes tnPlCrawl{from{clip-path:inset(100% 0 0 0);}to{clip-path:inset(" + (100 - CRAWL_TARGET) + "% 0 0 0);}}"
-    + "#tn-preloader svg.tn-pl-reveal{clip-path:inset(100% 0 0 0);will-change:clip-path;}"
+    /* The reveal is now driven by translateY() on the SVG itself, clipped by a
+       plain overflow:hidden wrapper - NOT by animating clip-path directly on the
+       SVG. clip-path on an element with hundreds of <path>s forces the browser to
+       rasterize the newly-exposed vector geometry on every single frame, and when
+       that collides with main-thread work (the video buffering/decoding) those
+       rasterization steps get delayed and bunched up - that's exactly the
+       "рывками" you were seeing. translateY is a pure compositor transform: the
+       SVG gets painted once into a texture and the GPU just slides it around,
+       the same way native scrolling works, so it stays smooth no matter what
+       else the main thread is doing. */
+    + "#tn-preloader .tn-pl-reveal-wrap{position:absolute;top:0;left:0;width:100%;height:100%;overflow:hidden;}"
+    + "@keyframes tnPlCrawl{from{transform:translateY(100%);}to{transform:translateY(" + (100 - CRAWL_TARGET) + "%);}}"
+    + "#tn-preloader svg.tn-pl-reveal{transform:translateY(100%);will-change:transform;backface-visibility:hidden;}"
     + "#tn-preloader svg.tn-pl-reveal.tn-pl-crawling{animation:tnPlCrawl " + CRAWL_DURATION + "ms cubic-bezier(.22,1,.36,1) forwards;}"
     /* only the final "video is ready, snap the rest of the way to 100%" step still
        uses a JS-set value - and it's a single one-off transition, not a repeating timer */
-    + "#tn-preloader svg.tn-pl-reveal.tn-pl-finishing{transition:clip-path " + (REVEAL_STEP_MS / 1000) + "s ease-out;}"
+    + "#tn-preloader svg.tn-pl-reveal.tn-pl-finishing{transition:transform " + (REVEAL_STEP_MS / 1000) + "s ease-out;}"
     + ".tn-pl-strokes{fill:none;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
     + ".tn-pl-strokes--white{stroke:#fff;}"
     + ".tn-pl-center--blue{fill:#274CD3;stroke:#000;stroke-width:2;vector-effect:non-scaling-stroke;}"
@@ -64,12 +69,16 @@
 
     /* reveal layer: black bg + white pattern + blue center A, always rendered full-size
        (never scaled - scaling stretched the pattern and the blue A, which is what caused
-       the distortion) and revealed bottom-up purely via a CSS clip-path transition */
-    + '<svg class="tn-pl-layer tn-pl-reveal" id="tn-pl-reveal" viewBox="' + VB + '" preserveAspectRatio="xMidYMid slice">'
-    +   '<rect width="' + VB_W + '" height="' + VB_H + '" fill="#000"/>'
-    +   '<use href="#tn-pl-shapes" class="tn-pl-strokes tn-pl-strokes--white"></use>'
-    +   '<use href="#centerA" class="tn-pl-center--blue"></use>'
-    + '</svg>'
+       the distortion). It sits inside a plain overflow:hidden wrapper and is revealed
+       bottom-up by translateY-ing the SVG itself (see CSS comment above for why, instead
+       of clip-path'ing the SVG's content directly). */
+    + '<div class="tn-pl-reveal-wrap">'
+    +   '<svg class="tn-pl-layer tn-pl-reveal" id="tn-pl-reveal" viewBox="' + VB + '" preserveAspectRatio="xMidYMid slice">'
+    +     '<rect width="' + VB_W + '" height="' + VB_H + '" fill="#000"/>'
+    +     '<use href="#tn-pl-shapes" class="tn-pl-strokes tn-pl-strokes--white"></use>'
+    +     '<use href="#centerA" class="tn-pl-center--blue"></use>'
+    +   '</svg>'
+    + '</div>'
 
     + '<div class="tn-pl-percent" id="tn-pl-percent">0%</div>';
 
@@ -116,14 +125,14 @@
        and "freezing" it before switching to the transition is what avoids a jump
        between "still crawling" and "final fill" - there's no instant only a smooth
        change of gears. */
-    var frozenClip = getComputedStyle(revealLayer).clipPath;
+    var frozenTransform = getComputedStyle(revealLayer).transform;
     revealLayer.classList.remove('tn-pl-crawling');
     revealLayer.style.animation = 'none';
-    revealLayer.style.clipPath = frozenClip;
+    revealLayer.style.transform = frozenTransform;
     void revealLayer.offsetHeight; // force reflow so the frozen value is registered first
     revealLayer.classList.add('tn-pl-finishing');
     requestAnimationFrame(function () {
-      revealLayer.style.clipPath = 'inset(0% 0 0 0)';
+      revealLayer.style.transform = 'translateY(0%)';
     });
 
     // percentLabel.textContent = '100%'; // отключено по просьбе (см. CSS: display:none)
