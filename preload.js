@@ -5,10 +5,11 @@
   var VIDEO_SELECTOR = '.tn-atom__videoiframe video';
   var MIN_BUFFER_AHEAD = 2;      // seconds of buffer required before we call it "ready"
   var FALLBACK_MS = 10000;       // hard cap, hide preloader no matter what
-  var CRAWL_TARGET = 92;         // soft % ceiling the fake progress creeps toward while waiting
-  var CRAWL_EASE = 0.0022;       // per-ms easing rate toward CRAWL_TARGET while waiting
-  var CRAWL_MIN_RATE = 0.0009;   // %/ms constant creep - keeps it inching even once close to target
-  var FINISH_EASE = 0.02;        // per-ms easing rate toward 100% once the real ready signal fires
+  var CRAWL_TARGET = 90;         // % the decorative crawl eases toward - purely cosmetic
+  var CRAWL_DURATION = 20000;    // ms - deliberately much longer than FALLBACK_MS, so the crawl
+                                  // can never finish and sit frozen on its own; it always gets
+                                  // interrupted by finish() first (see comment below)
+  var FINISH_TRANSITION_MS = 500; // ms - the final snap to 100% once the real ready signal fires
   var FINISH_HOLD_MS = 350;      // pause at 100% before fade out
   var BG_COLOR = '#ffffff';      // base (not-yet-loaded) background color
 
@@ -32,13 +33,18 @@
        Instead each layer is pre-rendered ONCE into a plain raster image (an inline
        SVG data-URI, which the browser rasterizes into a bitmap on decode, same as any
        .png would be) and clip-path is animated on THAT. Clipping a bitmap is one of
-       the cheapest things a browser does - identical cost to wiping across a photo -
-       so the frame rate stops depending on how complex the artwork is. The image
-       itself never moves or scales (object-fit:cover mimics the old
-       preserveAspectRatio="xMidYMid slice"), only its clip-path grows, driven every
-       rAF frame from elapsed real time so the fill also never goes idle - see
-       PROGRESS DRIVER below. */
+       the cheapest things a browser does - identical cost to wiping across a photo.
+       On top of that, the crawl below is a genuine CSS @keyframes animation, not JS
+       writing a style every rAF frame - that matters just as much as the bitmap swap.
+       A native animation runs entirely on the compositor thread with zero per-frame
+       JS/style-recalc cost, so it stays smooth no matter what the main thread is
+       doing. It's also completely decoupled from real loading state - purely
+       decorative, on its own fixed schedule. See PROGRESS DRIVER below for how the
+       real ready signal hooks in. */
     + "#tn-preloader img.tn-pl-reveal{clip-path:inset(100% 0 0 0);will-change:clip-path;}"
+    + "@keyframes tnPlCrawl{from{clip-path:inset(100% 0 0 0);}to{clip-path:inset(" + (100 - CRAWL_TARGET) + "% 0 0 0);}}"
+    + "#tn-preloader img.tn-pl-reveal.tn-pl-crawling{animation:tnPlCrawl " + CRAWL_DURATION + "ms cubic-bezier(.22,.7,.32,1) forwards;}"
+    + "#tn-preloader img.tn-pl-reveal.tn-pl-finishing{transition:clip-path " + (FINISH_TRANSITION_MS / 1000) + "s cubic-bezier(.22,.7,.32,1);}"
     /* percent label disabled per request - kept in the DOM (hidden) with Golos Text set,
        in case it needs to be switched back on later */
     + "#tn-preloader .tn-pl-percent{display:none;position:absolute;left:50%;bottom:6%;transform:translateX(-50%);"
@@ -110,54 +116,35 @@
   /* ===================== PROGRESS DRIVER ===================== */
 
   var done = false;
-  var progress = 0;          // 0..100, current revealed %
-  var target = CRAWL_TARGET; // soft ceiling while waiting; bumped to 100 once finish() fires
-  var lastTs = null;
-  var rafId = null;
 
-  function applyProgress(p) {
-    revealLayer.style.clipPath = 'inset(' + (100 - p).toFixed(2) + '% 0 0 0)';
-    // if (percentLabel) percentLabel.textContent = Math.round(p) + '%'; // отключено по просьбе
-  }
-
-  /* Every frame, ease `progress` toward `target` by a fraction of the remaining
-     distance, computed from real elapsed time (not a step counter) - so a slow or
-     delayed frame just means a bigger dt on the next one, never a pile of missed
-     steps to catch up on. On top of that, a tiny constant creep keeps it inching
-     forward even once it's basically caught up to `target`, so the bar is always
-     doing *something* - never a hard stop, only faster or slower. Calling finish()
-     just raises `target` to 100 (and switches to a snappier ease) - same loop,
-     same continuous motion, it just leans in and finishes instead of freezing then
-     jumping. */
-  function tick(ts) {
-    if (lastTs === null) lastTs = ts;
-    var dt = Math.min(ts - lastTs, 100); // clamp so a long main-thread stall can't cause a big catch-up jump
-    lastTs = ts;
-
-    var ease = done ? FINISH_EASE : CRAWL_EASE;
-    progress += (target - progress) * ease * dt;
-
-    if (!done && progress < target) {
-      progress += CRAWL_MIN_RATE * dt;
-      if (progress > target) progress = target;
-    }
-
-    if (done && progress > 99.6) {
-      applyProgress(100);
-      setTimeout(hidePreloader, FINISH_HOLD_MS);
-      return; // stop the loop, we're done
-    }
-
-    applyProgress(progress);
-    rafId = requestAnimationFrame(tick);
-  }
-
-  rafId = requestAnimationFrame(tick);
+  /* Kick off the decorative crawl - a plain CSS class toggle, the browser owns the
+     timing from here. CRAWL_DURATION is deliberately longer than FALLBACK_MS, and
+     finish() is always called within FALLBACK_MS (real ready signal or the hard
+     cap, whichever comes first) - so the crawl can never actually reach its own end
+     and sit frozen; it's always still mid-flight, actively easing, whenever finish()
+     fires. That's what guarantees "only ever speeds up or slows down, never stops". */
+  revealLayer.classList.add('tn-pl-crawling');
 
   function finish() {
     if (done) return;
     done = true;
-    target = 100;
+
+    /* Freeze the crawl exactly where it is right now, then hand off to a short
+       500ms eased transition the rest of the way to 100% - "доигрываем" the fill
+       instead of jumping. Reading the animation's live computed value before
+       switching to the transition is what avoids any visible pop between the two. */
+    var frozenClip = getComputedStyle(revealLayer).clipPath;
+    revealLayer.classList.remove('tn-pl-crawling');
+    revealLayer.style.animation = 'none';
+    revealLayer.style.clipPath = frozenClip;
+    void revealLayer.offsetHeight; // force reflow so the frozen value registers first
+    revealLayer.classList.add('tn-pl-finishing');
+    requestAnimationFrame(function () {
+      revealLayer.style.clipPath = 'inset(0% 0 0 0)';
+    });
+
+    // percentLabel.textContent = '100%'; // отключено по просьбе (см. CSS: display:none)
+    setTimeout(hidePreloader, FINISH_TRANSITION_MS + FINISH_HOLD_MS);
   }
 
   function hidePreloader() {
