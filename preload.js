@@ -149,6 +149,8 @@
 
   function hidePreloader() {
     preloader.classList.add('tn-preloader--hidden');
+    /* отпускаем отложенную Метрику ровно здесь - не раньше, не позже */
+    if (window.__releaseDelayedMetrika) window.__releaseDelayedMetrika();
     setTimeout(function () {
       if (preloader && preloader.parentNode) {
         preloader.parentNode.removeChild(preloader);
